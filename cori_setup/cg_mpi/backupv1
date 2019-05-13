@@ -1,0 +1,713 @@
+/*
+*   Matrix Market I/O example program
+*
+*   Read a real (non-complex) sparse matrix from a Matrix Market (v. 2.0) file.
+*   and copies it to stdout.  This porgram does nothing useful, but
+*   illustrates common usage of the Matrix Matrix I/O routines.
+*   (See http://math.nist.gov/MatrixMarket for details.)
+*
+*   Usage:  a.out [filename] > output
+*
+*
+*   NOTES:
+*
+*   1) Matrix Market files are always 1-based, i.e. the index of the first
+*      element of a matrix is (1,1), not (0,0) as in C.  ADJUST THESE
+*      OFFSETS ACCORDINGLY offsets accordingly when reading and writing
+*      to files.
+*
+*   2) ANSI C requires one to use the "l" format modifier when reading
+*      double precision floating point numbers in scanf() and
+*      its variants.  For example, use "%lf", "%lg", or "%le"
+*      when reading doubles, otherwise errors will occur.
+*/
+
+#include <string.h>
+#include <malloc.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "petscvec.h"   
+#include "mmio.h"
+#include "poski.h"
+#include <time.h>
+#include "utils.h"
+
+int mm_is_valid(MM_typecode matcode)
+{
+    if (!mm_is_matrix(matcode)) return 0;
+    if (mm_is_dense(matcode) && mm_is_pattern(matcode)) return 0;
+    if (mm_is_real(matcode) && mm_is_hermitian(matcode)) return 0;
+    if (mm_is_pattern(matcode) && (mm_is_hermitian(matcode) ||
+                mm_is_skew(matcode))) return 0;
+    return 1;
+}
+
+int mm_read_banner(FILE *f, MM_typecode *matcode)
+{
+    char line[MM_MAX_LINE_LENGTH];
+    char banner[MM_MAX_TOKEN_LENGTH];
+    char mtx[MM_MAX_TOKEN_LENGTH];
+    char crd[MM_MAX_TOKEN_LENGTH];
+    char data_type[MM_MAX_TOKEN_LENGTH];
+    char storage_scheme[MM_MAX_TOKEN_LENGTH];
+    char *p;
+
+
+    mm_clear_typecode(matcode);
+
+    if (fgets(line, MM_MAX_LINE_LENGTH, f) == NULL)
+        return MM_PREMATURE_EOF;
+
+    if (sscanf(line, "%s %s %s %s %s", banner, mtx, crd, data_type,
+        storage_scheme) != 5)
+        return MM_PREMATURE_EOF;
+
+    for (p=mtx; *p!='\0'; *p=tolower(*p),p++);  /* convert to lower case */
+    for (p=crd; *p!='\0'; *p=tolower(*p),p++);
+    for (p=data_type; *p!='\0'; *p=tolower(*p),p++);
+    for (p=storage_scheme; *p!='\0'; *p=tolower(*p),p++);
+
+    /* check for banner */
+    if (strncmp(banner, MatrixMarketBanner, strlen(MatrixMarketBanner)) != 0)
+        return MM_NO_HEADER;
+
+    /* first field should be "mtx" */
+    if (strcmp(mtx, MM_MTX_STR) != 0)
+        return  MM_UNSUPPORTED_TYPE;
+    mm_set_matrix(matcode);
+
+
+    /* second field describes whether this is a sparse matrix (in coordinate
+            storgae) or a dense array */
+
+
+    if (strcmp(crd, MM_SPARSEROW_STR) == 0)
+        mm_set_sparserow(matcode);
+    else
+    if (strcmp(crd, MM_COORDINATE_STR) == 0)
+        mm_set_coordinate(matcode);
+    else
+    if (strcmp(crd, MM_DENSE_STR) == 0)
+            mm_set_dense(matcode);
+    else
+        return MM_UNSUPPORTED_TYPE;
+
+
+    /* third field */
+
+    if (strcmp(data_type, MM_REAL_STR) == 0)
+        mm_set_real(matcode);
+    else
+    if (strcmp(data_type, MM_COMPLEX_STR) == 0)
+        mm_set_complex(matcode);
+    else
+    if (strcmp(data_type, MM_PATTERN_STR) == 0)
+        mm_set_pattern(matcode);
+    else
+    if (strcmp(data_type, MM_INT_STR) == 0)
+        mm_set_integer(matcode);
+    else
+        return MM_UNSUPPORTED_TYPE;
+
+
+    /* fourth field */
+
+    if (strcmp(storage_scheme, MM_GENERAL_STR) == 0)
+        mm_set_general(matcode);
+    else
+    if (strcmp(storage_scheme, MM_SYMM_STR) == 0)
+        mm_set_symmetric(matcode);
+    else
+    if (strcmp(storage_scheme, MM_HERM_STR) == 0)
+        mm_set_hermitian(matcode);
+    else
+    if (strcmp(storage_scheme, MM_SKEW_STR) == 0)
+        mm_set_skew(matcode);
+    else
+        return MM_UNSUPPORTED_TYPE;
+
+
+    return 0;
+}
+
+int mm_write_mtx_crd_size(FILE *f, int M, int N, int nz)
+{
+    if (fprintf(f, "%d %d %d\n", M, N, nz) != 3)
+        return MM_COULD_NOT_WRITE_FILE;
+    else
+        return 0;
+}
+
+int mm_read_mtx_crd_size(FILE *f, int *M, int *N, int *nz )
+{
+    char line[MM_MAX_LINE_LENGTH];
+    int num_items_read;
+
+    /* set return null parameter values, in case we exit with errors */
+    *M = *N = *nz = 0;
+
+    /* now continue scanning until you reach the end-of-comments */
+    do
+    {
+        if (fgets(line,MM_MAX_LINE_LENGTH,f) == NULL)
+            return MM_PREMATURE_EOF;
+    }while (line[0] == '%');
+
+    /* line[] is either blank or has M,N, nz */
+    if (sscanf(line, "%d %d %d", M, N, nz) == 3)
+        return 0;
+
+    else
+    do
+    {
+        num_items_read = fscanf(f, "%d %d %d", M, N, nz);
+        if (num_items_read == EOF) return MM_PREMATURE_EOF;
+    }
+    while (num_items_read != 3);
+
+    return 0;
+}
+
+
+int mm_read_mtx_array_size(FILE *f, int *M, int *N)
+{
+    char line[MM_MAX_LINE_LENGTH];
+    int num_items_read;
+    int nz;
+
+    /* set return null parameter values, in case we exit with errors */
+    *M = *N = 0;
+
+    /* now continue scanning until you reach the end-of-comments */
+    do
+    {
+        if (fgets(line,MM_MAX_LINE_LENGTH,f) == NULL)
+            return MM_PREMATURE_EOF;
+    }while (line[0] == '%');
+
+    /* line[] is either blank or has M,N, nz */
+    if (sscanf(line, "%d %d %*d", M, N) == 2)
+        return 0;
+
+    else /* we have a blank line */
+    do
+    {
+        num_items_read = fscanf(f, "%d %d %*d", M, N);
+        if (num_items_read == EOF) return MM_PREMATURE_EOF;
+    }
+    while (num_items_read != 2);
+
+    return 0;
+}
+
+int mm_write_mtx_array_size(FILE *f, int M, int N)
+{
+    if (fprintf(f, "%d %d\n", M, N) != 2)
+        return MM_COULD_NOT_WRITE_FILE;
+    else
+        return 0;
+}
+
+
+
+/*-------------------------------------------------------------------------*/
+
+/******************************************************************/
+/* use when I[], J[], and val[]J, and val[] are already allocated */
+/******************************************************************/
+
+int mm_read_mtx_crd_data(FILE *f, int M, int N, int nz, int I[], int J[],
+        double val[], MM_typecode matcode)
+{
+    int i;
+    if (mm_is_complex(matcode))
+    {
+        for (i=0; i<nz; i++)
+            if (fscanf(f, "%d %d %lg %lg", &I[i], &J[i], &val[2*i], &val[2*i+1])
+                != 4) return MM_PREMATURE_EOF;
+    }
+    else if (mm_is_real(matcode))
+    {
+        for (i=0; i<nz; i++)
+        {
+            if (fscanf(f, "%d %d %lg\n", &I[i], &J[i], &val[i])
+                != 3) return MM_PREMATURE_EOF;
+
+        }
+    }
+
+    else if (mm_is_pattern(matcode))
+    {
+        for (i=0; i<nz; i++)
+            if (fscanf(f, "%d %d", &I[i], &J[i])
+                != 2) return MM_PREMATURE_EOF;
+    }
+    else
+        return MM_UNSUPPORTED_TYPE;
+
+    return 0;
+
+}
+
+int mm_read_mtx_crd_entry(FILE *f, int *I, int *J,
+        double *real, double *imag, MM_typecode matcode)
+{
+    if (mm_is_complex(matcode))
+    {
+            if (fscanf(f, "%d %d %lg %lg", I, J, real, imag)
+                != 4) return MM_PREMATURE_EOF;
+    }
+    else if (mm_is_real(matcode))
+    {
+            if (fscanf(f, "%d %d %lg\n", I, J, real)
+                != 3) return MM_PREMATURE_EOF;
+
+    }
+
+    else if (mm_is_pattern(matcode))
+    {
+            if (fscanf(f, "%d %d", I, J) != 2) return MM_PREMATURE_EOF;
+    }
+    else
+        return MM_UNSUPPORTED_TYPE;
+
+    return 0;
+
+}
+
+
+/************************************************************************
+    mm_read_mtx_crd()  fills M, N, nz, array of values, and return
+                        type code, e.g. 'MCRS'
+
+                        if matrix is complex, values[] is of size 2*nz,
+                            (nz pairs of real/imaginary values)
+************************************************************************/
+
+int mm_read_mtx_crd(char *fname, int *M, int *N, int *nz, int **I, int **J,
+        double **val, MM_typecode *matcode)
+{
+    int ret_code;
+    FILE *f;
+
+    if (strcmp(fname, "stdin") == 0) f=stdin;
+    else
+    if ((f = fopen(fname, "r")) == NULL)
+        return MM_COULD_NOT_READ_FILE;
+
+
+    if ((ret_code = mm_read_banner(f, matcode)) != 0)
+        return ret_code;
+
+    if (!(mm_is_valid(*matcode) && mm_is_sparse(*matcode) &&
+            mm_is_matrix(*matcode)))
+        return MM_UNSUPPORTED_TYPE;
+
+    if ((ret_code = mm_read_mtx_crd_size(f, M, N, nz)) != 0)
+        return ret_code;
+
+
+    *I = (int *)  malloc(*nz * sizeof(int));
+    *J = (int *)  malloc(*nz * sizeof(int));
+    *val = NULL;
+
+    if (mm_is_complex(*matcode))
+    {
+        *val = (double *) malloc(*nz * 2 * sizeof(double));
+        ret_code = mm_read_mtx_crd_data(f, *M, *N, *nz, *I, *J, *val,
+                *matcode);
+        if (ret_code != 0) return ret_code;
+    }
+    else if (mm_is_real(*matcode))
+    {
+        *val = (double *) malloc(*nz * sizeof(double));
+        ret_code = mm_read_mtx_crd_data(f, *M, *N, *nz, *I, *J, *val,
+                *matcode);
+        if (ret_code != 0) return ret_code;
+    }
+
+    else if (mm_is_pattern(*matcode))
+    {
+        ret_code = mm_read_mtx_crd_data(f, *M, *N, *nz, *I, *J, *val,
+                *matcode);
+        if (ret_code != 0) return ret_code;
+    }
+
+    if (f != stdin) fclose(f);
+    return 0;
+}
+
+int mm_write_banner(FILE *f, MM_typecode matcode)
+{
+    char *str = mm_typecode_to_str(matcode);
+    int ret_code;
+
+    ret_code = fprintf(f, "%s %s\n", MatrixMarketBanner, str);
+    free(str);
+    if (ret_code !=2 )
+        return MM_COULD_NOT_WRITE_FILE;
+    else
+        return 0;
+}
+
+int mm_write_mtx_crd(char fname[], int M, int N, int nz, int I[], int J[],
+        double val[], MM_typecode matcode)
+{
+    FILE *f;
+    int i;
+
+    if (strcmp(fname, "stdout") == 0)
+        f = stdout;
+    else
+    if ((f = fopen(fname, "w")) == NULL)
+        return MM_COULD_NOT_WRITE_FILE;
+
+    /* print banner followed by typecode */
+    fprintf(f, "%s ", MatrixMarketBanner);
+    fprintf(f, "%s\n", mm_typecode_to_str(matcode));
+
+    /* print matrix sizes and nonzeros */
+    fprintf(f, "%d %d %d\n", M, N, nz);
+
+    /* print values */
+    if (mm_is_pattern(matcode))
+        for (i=0; i<nz; i++)
+            fprintf(f, "%d %d\n", I[i], J[i]);
+    else
+    if (mm_is_real(matcode))
+        for (i=0; i<nz; i++)
+            fprintf(f, "%d %d %20.16g\n", I[i], J[i], val[i]);
+    else
+    if (mm_is_complex(matcode))
+        for (i=0; i<nz; i++)
+            fprintf(f, "%d %d %20.16g %20.16g\n", I[i], J[i], val[2*i],
+                        val[2*i+1]);
+    else
+    {
+        if (f != stdout) fclose(f);
+        return MM_UNSUPPORTED_TYPE;
+    }
+
+    if (f !=stdout) fclose(f);
+
+    return 0;
+}
+
+
+char  *mm_typecode_to_str(MM_typecode matcode)
+{
+    char buffer[MM_MAX_LINE_LENGTH];
+    char *types[4];
+    int error =0;
+
+    /* check for MTX type */
+    if (mm_is_matrix(matcode))
+        types[0] = MM_MTX_STR;
+    else
+        error=1;
+
+    /* check for CRD or ARR matrix */
+    if (mm_is_sparserow(matcode))
+        types[1] = MM_SPARSEROW_STR;
+    else
+    if (mm_is_coordinate(matcode))
+        types[1] = MM_COORDINATE_STR;
+    else
+    if (mm_is_dense(matcode))
+        types[1] = MM_DENSE_STR;
+    else
+        return NULL;
+
+    /* check for element data type */
+    if (mm_is_real(matcode))
+        types[2] = MM_REAL_STR;
+    else
+    if (mm_is_complex(matcode))
+        types[2] = MM_COMPLEX_STR;
+    else
+    if (mm_is_pattern(matcode))
+        types[2] = MM_PATTERN_STR;
+    else
+    if (mm_is_integer(matcode))
+        types[2] = MM_INT_STR;
+    else
+        return NULL;
+
+
+    /* check for symmetry type */
+    if (mm_is_general(matcode))
+        types[3] = MM_GENERAL_STR;
+    else
+    if (mm_is_symmetric(matcode))
+        types[3] = MM_SYMM_STR;
+    else
+    if (mm_is_hermitian(matcode))
+        types[3] = MM_HERM_STR;
+    else
+    if (mm_is_skew(matcode))
+        types[3] = MM_SKEW_STR;
+    else
+        return NULL;
+
+    sprintf(buffer,"%s %s %s %s", types[0], types[1], types[2], types[3]);
+    return strdup(buffer);
+
+}
+
+
+double dot_prod(double* a,double* b,int n){
+   double ret =0.0;
+   #pragma omp for
+   for (int i=0;i<n;i++){
+      //printf("residue %d %lf %lf %lf: \n",i,ret,a[i],b[i]);
+      ret+= a[i]*b[i];
+   }
+   return ret;
+}
+
+// target = target +/- mult * to_process
+void vec_add(double* target, double* source ,double* to_process, double mult, int n, int add)
+{
+   mult = mult*add;
+   #pragma omp for
+   for (int i=0;i<n;i++){
+      target[i] = source[i] + mult*to_process[i];
+   }   
+}
+
+
+int main(int argc, char *argv[])
+{
+    int ret_code;
+    MM_typecode matcode;
+    FILE *f;
+    int M, N, nz;
+    int i, *I, *J,*JA;
+    double *val;
+    srand((unsigned) 1);
+    if (argc < 2)
+	{
+		fprintf(stderr, "Usage: %s [martix-market-filename]\n", argv[0]);
+		exit(1);
+	}
+    else
+    {
+        if ((f = fopen(argv[1], "r")) == NULL)
+            exit(1);
+    }
+
+    if (mm_read_banner(f, &matcode) != 0)
+    {
+        printf("Could not process Matrix Market banner.\n");
+        exit(1);
+    }
+
+
+    /*  This is how one can screen matrix types if their application */
+    /*  only supports a subset of the Matrix Market data types.      */
+
+    if (mm_is_complex(matcode) && mm_is_matrix(matcode) &&
+            mm_is_sparse(matcode) )
+    {
+        printf("Sorry, this application does not support ");
+        printf("Market Market type: [%s]\n", mm_typecode_to_str(matcode));
+        exit(1);
+    }
+
+    /* find out size of sparse matrix .... */
+
+    if ((ret_code = mm_read_mtx_crd_size(f, &M, &N, &nz)) !=0)
+        exit(1);
+
+
+    /* reseve memory for matrices */
+
+    I = (int *) malloc(nz * sizeof(int));
+    J = (int *) malloc(nz * sizeof(int));
+    JA= (int *) malloc((M+1) * sizeof(int));
+    val = (double *) malloc(nz * sizeof(double));
+
+
+    /* NOTE: when reading in doubles, ANSI C requires the use of the "l"  */
+    /*   specifier as in "%lg", "%lf", "%le", otherwise errors will occur */
+    /*  (ANSI C X3.159-1989, Sec. 4.9.6.2, p. 136 lines 13-15)            */
+    JA[0]=0;
+    int JA_idx=1;
+    for (i=0; i<nz; i++)
+    {
+        fscanf(f, "%d %d %lg\n", &I[i], &J[i], &val[i]);
+        I[i]--;  /* adjust from 1-based to 0-based */
+        J[i]--;
+        if (I[i]==J[i]){
+           val[i] = val[i]/2;
+           // since the MM format only stores half of the matrix when symmetric, we divide the diagnoal by half, and reulting M satisfies A = M + M.T
+        }
+        //if (i>0 && J[i]>J[i-1]){
+        //   JA_idx+=1;
+        //   JA[JA_idx]=i;
+        //}
+        while (J[i]>=JA_idx){
+            JA[JA_idx]=i;
+            JA_idx++;
+        }
+    }
+    JA[M] = nz;
+
+    if (f !=stdin) fclose(f);
+
+    /************************/
+    /* now write out matrix */
+    /************************/
+
+    mm_write_banner(stdout, matcode);
+    mm_write_mtx_crd_size(stdout, M, N, nz);
+    //for (i=0; i<nz; i++)
+    //    fprintf(stdout, "%d %d %20.19g\n", I[i], J[i], val[i]);
+    time_t s;
+    struct tm* current_time;
+
+    printf("begin pOski!\n");
+    s = time(NULL);   
+    // to get current time 
+    current_time = localtime(&s); 
+    // print time in minutes, 
+    // hours and seconds 
+    printf("start at %02d:%02d:%02d\n", current_time->tm_hour, current_time->tm_min, current_time->tm_sec);
+
+        //STEP 1: /* Initialize pOSKI library */
+        poski_Init();
+        //STEP 2: /* Initialize Sparse matrix A in CSR format, and dense vectors */
+        int nrows=M; int ncols=N; int nnz=nz;
+        //int Aptr[4]={0, 1, 3, 5}; int Aind[5]={0, 0, 1, 0, 2}; double Aval[5]={1, -2, 1, 0.5, 1};
+        double *x = (double *) malloc(M * sizeof(double));
+        double *r = (double *) malloc(M * sizeof(double));
+        double *p = (double *) malloc(M * sizeof(double));
+        double *b = (double *) malloc(M * sizeof(double));
+        double *sol = (double *) malloc(M * sizeof(double));
+        double *Ap = (double *) malloc(M * sizeof(double));
+
+
+
+
+        //STEP 3: /* Create a default thread object {with #threads = #available_cores} */
+        clock_t before = clock();
+        poski_threadarg_t *poski_thread = poski_InitThreads();
+
+        //poski_sparse_matrix_t *Sp_A = poski_LoadMatrix_MM_to_CSR (, poski_index_t MakeUnsymmetric)
+
+
+        //STEP 4: /* Create a tunable-matrix object by wrapping the partitioned sub-matrices using a thread object and a default partition-matrix object {with #partitions = #threads} */
+        poski_mat_t A_tunable =
+        poski_CreateMatCSR ( JA, I, val, nrows, ncols, nnz,/* Sparse matrix A in CSR format */
+        SHARE_INPUTMAT, /* <matrix copy mode> */
+        poski_thread, /* <thread object> */
+        NULL, /* <partition-matrix object> (NULL: default) */
+        2, INDEX_ZERO_BASED, MAT_GENERAL);/* specify how to interpret non-zero pattern */
+
+        //STEP 5: /* Create wrappers around the dense vectors with <partition-vector object> (NULL: default) */
+        poski_vec_t x_view = poski_CreateVec(x, nrows, STRIDE_UNIT, NULL);
+        poski_vec_t r_view = poski_CreateVec(r, nrows, STRIDE_UNIT, NULL);
+        poski_vec_t p_view = poski_CreateVec(p, nrows, STRIDE_UNIT, NULL);
+        poski_vec_t b_view = poski_CreateVec(b, nrows, STRIDE_UNIT, NULL);
+        poski_vec_t sol_view = poski_CreateVec(sol, nrows, STRIDE_UNIT, NULL);
+        poski_vec_t Ap_view = poski_CreateVec(Ap, nrows, STRIDE_UNIT, NULL);
+
+        //STEP 6: /* Partition input/output vectors and Perform matrix vector multiply (SpMV), y = α!Ax + β!y */
+        //poski_report_MatMultCSR(A_tunable, OP_NORMAL, alpha, x_view, beta, y_view);
+        //for (int temp=0;temp<100000;temp++)poski_MatMult(A_tunable, OP_NORMAL, alpha, x_view, beta, y_view);
+        
+
+        s = time(NULL);
+        // to get current time 
+        current_time = localtime(&s);
+        // print time in minutes, 
+        // hours and seconds 
+        printf("finish init at %02d:%02d:%02d\n", current_time->tm_hour, current_time->tm_min, current_time->tm_sec);
+
+
+        // begin actual algorithm
+        //initialization find sol,b
+        #pragma omp for
+        for (int temp=0;temp<nrows;temp++) {
+            sol[temp]=temp;
+            x[temp]=0;r[temp]=0;b[temp]=0.0;
+        }
+        poski_MatMult(A_tunable, OP_NORMAL, 1.0, sol_view, 1.0, b_view);
+        poski_MatMult(A_tunable, OP_TRANS, 1.0, sol_view, 1.0, b_view);
+        
+        #pragma omp for
+        for (int temp=0;temp<nrows;temp++) {
+            r[temp]=b[temp];
+            p[temp]=b[temp];
+        }
+        // r = b - A*x, since x is 0 initially, p=r=b
+        
+        double residue = dot_prod(r,r,M),prev_residue;
+        double alpha,beta;
+        // residue = r.T @ r
+        residue = dot_prod(r,r,M);printf("current residue is %lf. \n",residue);
+
+        current_time = localtime(&s);
+        printf("begin while loop at %02d:%02d:%02d\n", current_time->tm_hour, current_time->tm_min, current_time->tm_sec);
+        int it=0;
+        while (it<20){
+            it++;
+            // Ap = A @ p
+            poski_MatMult(A_tunable, OP_NORMAL, 1.0, p_view, 0.0, Ap_view);
+            poski_MatMult(A_tunable, OP_TRANS, 1.0, p_view, 1.0, Ap_view);
+
+            alpha = residue / dot_prod(p,Ap,M) ;
+            //printf(" current alpha is %lf\n",alpha);
+
+            // x = x + alpha*p
+            vec_add(x,x,p,alpha,M,1);
+
+
+            if ((it+1)%20000==0){
+               //r = b-A@x
+               for (int temp=0;temp<M;temp++)r[temp]=b[temp];
+               poski_MatMult(A_tunable, OP_NORMAL,-1.0, x_view, 1.0, r_view);
+               poski_MatMult(A_tunable, OP_TRANS, -1.0, x_view, 1.0, r_view);
+            }
+            else{
+                // r = r - alpha* Ap
+                vec_add(r,r,Ap,alpha,M,-1); 
+            }
+            prev_residue = residue;
+            // residue = r.T @ r
+            residue = dot_prod(r,r,M);
+            //printf("current residue is %lf. \n",residue);
+            
+            beta = residue / prev_residue; 
+            //printf(" current beta is %lf\n",beta);
+
+            vec_add(p,r,p,beta,M,1); 
+        }
+
+
+
+
+        clock_t difference = clock() - before;
+        s = time(NULL);
+        // to get current time 
+        current_time = localtime(&s);
+        // print time in minutes, 
+        // hours and seconds 
+        printf("end at %02d:%02d:%02d\n", current_time->tm_hour, current_time->tm_min, current_time->tm_sec);
+        printf("it takes %f seconds to finish!\n\n",1.0*difference / CLOCKS_PER_SEC);
+
+        //for (int temp=0;temp<nrows;temp++)printf("%d %f\n",temp,*(y_view->vec+temp));
+
+        //STEP 7: /* Clean-up interface objects and threads, and shut down pOSKI library */
+        poski_DestroyMat(A_tunable); 
+        //poski_DestroyVec(x_view);
+        //poski_DestroyVec(r_view);
+        //poski_DestroyVec(p_view);
+        //poski_DestroyVec(b_view);
+        //poski_DestroyVec(sol_view);
+        //poski_DestroyVec(Ap_view);
+        //poski_DestroyThreads(poski_thread);
+        poski_Close();
+	return 0;
+}
