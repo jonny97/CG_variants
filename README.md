@@ -14,7 +14,7 @@ This is the repo that contains the files for Jiannan Jiang's course project for 
    
 # EE227C project files:
    This projects demostrates a "smoothing" variant of CG that performs better than original CG in harder problems.
-   
+   Serial Version is shown in the CG_variants.ipynb notebook. For parallel implementation, see CS267 Project.  
 
 
 
